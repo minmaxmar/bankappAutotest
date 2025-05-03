@@ -1,0 +1,112 @@
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "net/http"
+    "time"
+
+    "google.golang.org/protobuf/proto"
+    "google.golang.org/grpc"
+    // Import your protobuf generated code here.  Replace with your package name
+    myproto "your_package_name/proto" // Replace with your package name
+)
+
+for route, methods := range parsedSpec {
+    fmt.Printf("Route: %s\n", route)
+    for m, info := range methods {
+        fmt.Printf("  Method: %s\n", m)
+        fmt.Printf("    Summary: %s\n", info.Summary)
+        fmt.Printf("    Parameters:\n")
+        for _, p := range info.Parameters {
+            fmt.Printf("      - %s (%s), required: %v\n", p.Name, p.In, p.Required)
+        }
+        fmt.Printf("    Responses:\n")
+        for code, resp := range info.Responses {
+            fmt.Printf("      %s: %v\n", code, resp)
+        }
+    }
+}
+
+func main() {
+    // Replace with your gRPC server address
+    grpcAddress := "localhost:50051"
+
+    // Create a connection to the gRPC server
+    conn, err := grpc.Dial(grpcAddress, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+    if err != nil {
+        log.Fatalf("Failed to connect to gRPC server: %v", err)
+    }
+    defer conn.Close()
+
+    // Create a client for your gRPC service
+    client := myproto.NewMyServiceClient(conn)
+
+    // Create a context with a timeout
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    // Call the gRPC method to get handler information
+    request := &myproto.GetHandlersRequest{} // Replace with your request type
+    response, err := client.GetHandlers(ctx, request)
+    if err != nil {
+        log.Fatalf("Failed to get handlers: %v", err)
+    }
+
+    // Process the response and populate the channel
+    handlerChannel := make(chan string)
+    go func() {
+        for _, handler := range response.GetHandlers() {
+            handlerChannel <- handler.GetName()
+        }
+        close(handlerChannel)
+    }()
+
+    // Process the handlers from the channel
+    for handler := range handlerChannel {
+        fmt.Println("Handler:", handler)
+    }
+
+    // Optionally, check for any errors in the channel
+    select {
+    case err := <-handlerChannel:
+        log.Println("Error received:", err)
+    default:
+        // No errors occurred
+    }
+
+    // Example of how to handle a failure to get all handlers
+    if response.GetError() != nil {
+        log.Printf("Error from server: %s", response.GetError().GetMessage())
+    }
+}
+
+
+
+
+// In your gRPC server code
+func (s *server) GetHandlers(ctx context.Context, req *myproto.GetHandlersRequest) (*myproto.GetHandlersResponse, error) {
+    handlers := []string{"handler1", "handler2", "handler3"} // Replace with your handlers
+    return &myproto.GetHandlersResponse{Handlers: handlers}, nil
+}
+
+
+
+
+GetHandlersResponse.proto
+syntax = "proto3";
+
+package your_package_name;
+
+service MyService {
+  rpc GetHandlers (GetHandlersRequest) returns (GetHandlersResponse);
+}
+
+message GetHandlersRequest {
+}
+
+message GetHandlersResponse {
+  repeated string handlers = 1;
+  google.rpc.Status error = 2; // For error handling
+}
