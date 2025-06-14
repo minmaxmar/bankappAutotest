@@ -1,15 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 )
 
 type SwaggerSpec struct {
-	Paths map[string]interface{} `json:"paths"`
+	Paths       map[string]interface{}            `json:"paths"`
+	Definitions map[string]map[string]interface{} `json:"definitions"`
 }
 
 type Parameter struct {
@@ -17,6 +22,7 @@ type Parameter struct {
 	Name     string `json:"name"`
 	Required bool   `json:"required"`
 	Type     string `json:"type"`
+	Format   string `json:"format"`
 }
 
 type MethodInfo struct {
@@ -96,6 +102,7 @@ func parsePaths(rawPaths map[string]interface{}) RouteMethodsList {
 							Name:     getString(pMap, "name"),
 							Required: getBool(pMap, "required"),
 							Type:     getString(pMap, "type"),
+							Format:   getString(pMap, "format"),
 						}
 						params = append(params, param)
 					}
@@ -128,15 +135,15 @@ func parsePaths(rawPaths map[string]interface{}) RouteMethodsList {
 func debugMethod(info MethodInfo) {
 	fmt.Printf("Route: %s\n", info.Route)
 	fmt.Printf("  Method: %s\n", info.Method)
-	fmt.Printf("    Summary: %s\n", info.Summary)
+	// fmt.Printf("    Summary: %s\n", info.Summary)
 	fmt.Printf("    Parameters:\n")
 	for _, p := range info.Parameters {
 		fmt.Printf("      - %s (%s), required: %v\n", p.Name, p.In, p.Required)
 	}
-	fmt.Printf("    Responses:\n")
-	for code, resp := range info.Responses {
-		fmt.Printf("      %s: %v\n", code, resp)
-	}
+	// fmt.Printf("    Responses:\n")
+	// for code, resp := range info.Responses {
+	// 	fmt.Printf("      %s: %v\n", code, resp)
+	// }
 
 }
 
@@ -175,17 +182,17 @@ func main() {
 	methodsCh := make(chan MethodInfo)
 
 	semaphore := make(chan struct{}, maxConcurrency)
-	// var wg sync.WaitGroup
+	var wg sync.WaitGroup
 
 	go func() {
 		for _, methodInf := range parsedSpec {
 
-			// wg.Add(1)
+			wg.Add(1)
 			go func(m MethodInfo) {
 				// !!!! внутри горутины semaphore <- struct{}{}
 				semaphore <- struct{}{}
 				defer func() { <-semaphore }()
-				// defer wg.Done()
+				defer wg.Done()
 				// debugMethod(m)
 				methodsCh <- m
 			}(methodInf)
@@ -193,12 +200,115 @@ func main() {
 		// for i := 0; i < maxConcurrency; i++ {
 		// 	semaphore <- struct{}{}
 		// }
-		// wg.Wait()
+		wg.Wait()
 		close(methodsCh)
 	}()
 
 	// TODO: FAN-OUT goroutine to deliver processed requests to postgres
-	for method := range methodsCh {
-		fmt.Println("Processed method:", method)
+	for methodInfo := range methodsCh {
+		baseURL := "http://localhost:8080/v2"
+		url := baseURL + methodInfo.Route
+
+		var bodyData interface{}
+		for _, param := range methodInfo.Parameters {
+			if param.In == "body" {
+				bodyData = generateSampleDataFromSchema(resolveRef(param.Name, spec.Definitions))
+			}
+		}
+
+		var payload []byte
+		if bodyData != nil {
+			fmt.Printf("bodyData: %v\n\n", bodyData)
+			payload, err = json.Marshal(bodyData)
+			if err != nil {
+				fmt.Printf("Error marshaling request data for %s: %v", payload, err)
+				continue
+			}
+		}
+
+		req, err := http.NewRequest(methodInfo.Method, url, bytes.NewReader(payload))
+		if err != nil {
+			fmt.Printf("Error creating request for %s %s: %v", methodInfo.Method, url, err)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		// Send the request
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("Request failed for %s %s: %v", methodInfo.Method, url, err)
+			continue
+		}
+		// Read response
+		respBody, err := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			fmt.Printf("Error reading response for %s %s: %v", methodInfo.Method, url, err)
+			continue
+		}
+		fmt.Printf("Response for %s %s: %s\n\n\n", methodInfo.Method, url, string(respBody))
+
 	}
+
+}
+func resolveRef(ref string, schemas map[string]map[string]interface{}) map[string]interface{} {
+	lowerSearchKey := strings.ToLower(ref)
+	for k, v := range schemas {
+		if strings.ToLower(k) == lowerSearchKey {
+			return v
+		}
+	}
+	return nil
+}
+
+func generateSampleDataFromSchema(schema map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+
+	properties, ok := schema["properties"].(map[string]interface{})
+	if !ok {
+		return result
+	}
+
+	for propName, propSchema := range properties {
+		propMap, ok := propSchema.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		t, _ := propMap["type"].(string)
+		f, _ := propMap["format"].(string)
+		switch t {
+		case "string":
+			switch f {
+			case "date-time":
+				result[propName] = "2023-10-10T10:00:00Z"
+			case "date":
+				result[propName] = "2023-10-10"
+			case "uuid":
+				result[propName] = "123e4567-e89b-12d3-a456-426614174000"
+			default:
+				result[propName] = "sample string"
+			}
+		case "integer":
+			result[propName] = 1
+		case "number":
+			result[propName] = 1.23
+		case "boolean":
+			result[propName] = true
+		case "array":
+			items, ok := propMap["items"].(map[string]interface{})
+			if ok {
+				result[propName] = []interface{}{generateSampleDataFromSchema(items)}
+			} else {
+				result[propName] = []interface{}{}
+			}
+		case "object":
+			result[propName] = generateSampleDataFromSchema(propMap)
+		default:
+			result[propName] = nil
+		}
+	}
+
+	return result
 }
